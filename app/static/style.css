@@ -93,3 +93,75 @@ dialog::backdrop { background: rgba(15,39,66,.45); }
 dialog article { padding: 22px; }
 .dlg-meta { font-size: 12px; color: #64748b; margin: 8px 0 14px; }
 #dlg-body { line-height: 1.8; font-size: 14px; white-space: pre-wrap; }
+
+/* ===== 医学事实核查标注区 ===== */
+.topnav { display: flex; gap: 14px; }
+.topnav a { color: #b8c7dc; text-decoration: none; font-size: 13px; padding: 3px 0; }
+.topnav a.active, .topnav a:hover { color: #fff; border-bottom: 2px solid #60a5fa; }
+.revision-badge {
+  font-size: 12px; background: #1e3a5f; border: 1px solid #475569;
+  border-radius: 999px; padding: 2px 10px; color: #e2e8f0;
+}
+.annotation-layout {
+  display: grid; grid-template-columns: 380px 1fr;
+  gap: 16px; padding: 16px 24px; align-items: start;
+}
+@media (max-width: 1000px) { .annotation-layout { grid-template-columns: 1fr; } }
+.count-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.count-card {
+  border-radius: 8px; padding: 10px; text-align: center; font-size: 12px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.count-card .n { font-size: 22px; font-weight: 700; }
+.count-card.needs { background: #fee2e2; color: #991b1b; }
+.count-card.no { background: #dcfce7; color: #166534; }
+.count-card.rest { background: #f1f5f9; color: #475569; }
+.threshold-msg { font-size: 12px; margin: 10px 0 12px; }
+.threshold-msg.met { color: #16a34a; }
+.threshold-msg.not-met { color: #b45309; }
+.btn-block { width: 100%; }
+.btn-small { padding: 3px 9px; font-size: 12px; border-radius: 5px; }
+.btn-small.needs.active { background: #dc2626; border-color: #dc2626; color: #fff; }
+.btn-small.no.active { background: #16a34a; border-color: #16a34a; color: #fff; }
+.btn-small.ghost { color: #64748b; }
+.train-status { font-size: 12px; margin-top: 10px; padding: 8px 10px; border-radius: 6px; background: #f1f5f9; color: #475569; }
+.train-status.running, .train-status.pending { background: #fef3c7; color: #92400e; }
+.train-status.done { background: #dcfce7; color: #166534; }
+.train-status.failed { background: #fee2e2; color: #991b1b; }
+.train-status.stale { background: #e2e8f0; color: #475569; }
+.hint { font-size: 12px; color: #64748b; line-height: 1.7; margin: 6px 0; }
+.suggestions { display: flex; flex-direction: column; gap: 8px; }
+.suggestion-card {
+  border: 1px solid #fbbf24; background: #fffbeb; border-radius: 8px;
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 6px;
+}
+.sc-head { display: flex; justify-content: space-between; font-size: 12px; color: #92400e; gap: 8px; }
+.sc-article { font-weight: 600; }
+.sc-prob { white-space: nowrap; }
+.sc-text { font-size: 13px; line-height: 1.7; }
+.sc-actions { display: flex; gap: 8px; }
+.toolbar { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; flex-wrap: wrap; }
+.filter-input.inline { flex: 1; min-width: 180px; margin: 0; }
+.checkline { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #475569; }
+.checkline input { width: auto; }
+.article-blocks { max-height: 760px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+.article-block { border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; }
+.ab-head {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  background: #f8fafc; font-size: 13px; font-weight: 600; color: #0f2742;
+}
+.sentence-row {
+  display: grid; grid-template-columns: 1fr auto; gap: 10px;
+  padding: 9px 12px; border-top: 1px solid #eef2f7; align-items: center;
+}
+.sentence-row.labeled.needs_check { background: #fff5f5; }
+.sentence-row.labeled.no_check { background: #f4fdf5; }
+.sr-text { font-size: 13px; line-height: 1.7; }
+.sr-actions { display: flex; align-items: center; gap: 6px; }
+.sr-state { font-size: 11px; color: #94a3b8; min-width: 48px; text-align: right; }
+.toast {
+  position: fixed; right: 24px; bottom: 24px; z-index: 50; max-width: 460px;
+  padding: 10px 16px; border-radius: 8px; font-size: 13px; line-height: 1.6;
+  box-shadow: 0 6px 20px rgba(15,39,66,.22); background: #0f2742; color: #fff;
+}
+.toast.error { background: #991b1b; }

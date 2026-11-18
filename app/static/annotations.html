@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>医学事实核查标注区</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <h1>医学事实核查标注区</h1>
+  <div class="meta">
+    <nav class="topnav">
+      <a href="/">选题推荐</a>
+      <a href="/annotations" class="active">医学事实核查</a>
+    </nav>
+    <span id="revision-badge" class="revision-badge">修订 0</span>
+    <button id="btn-reset" class="btn btn-ghost">重置全部演示</button>
+  </div>
+</header>
+
+<main class="annotation-layout">
+  <!-- 左栏：进度与训练 -->
+  <section class="panel">
+    <h2>1. 标注进度</h2>
+    <div class="count-grid">
+      <div class="count-card needs"><span class="n" id="count-needs">0</span><span>需核查</span></div>
+      <div class="count-card no"><span class="n" id="count-no">0</span><span>无需核查</span></div>
+      <div class="count-card rest"><span class="n" id="count-unlabeled">0</span><span>未标注</span></div>
+    </div>
+    <div id="threshold-msg" class="threshold-msg"></div>
+
+    <button id="btn-train" class="btn btn-primary btn-block">训练并推荐待核查句</button>
+    <div id="train-msg" class="msg"></div>
+    <div id="train-status" class="train-status"></div>
+
+    <h2 style="margin-top:22px">2. 双窗口协作说明</h2>
+    <p class="hint">
+      每个提交都带着“标注修订号”。两个窗口同时编辑时，后提交者若基于旧修订号，
+      服务端会拒绝并提示冲突，页面自动刷新到最新标注，不会覆盖他人修改。
+      更正标注后，之前训练出的建议会立即失效，不再作为当前结果展示。
+    </p>
+
+    <h2 style="margin-top:22px">3. 本轮推荐</h2>
+    <div id="suggestions" class="suggestions"></div>
+
+    <h2 style="margin-top:22px">4. 训练失败模拟</h2>
+    <p class="hint">用于验证“训练失败仍保留标签并显示失败状态”。</p>
+    <label class="checkline">
+      <input type="checkbox" id="force-fail" />
+      下一次训练强制失败（仅本轮）
+    </label>
+  </section>
+
+  <!-- 右栏：待标句（按原文顺序） -->
+  <section class="panel">
+    <h2>医疗健康文章 · 按原文顺序逐句标注</h2>
+    <div class="toolbar">
+      <label class="checkline">
+        <input type="checkbox" id="only-unlabeled" checked />
+        仅显示未标注句
+      </label>
+      <input id="sentence-filter" class="filter-input inline" placeholder="按文章标题 / 句子内容筛选……" />
+    </div>
+    <div id="article-blocks" class="article-blocks"></div>
+  </section>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="/static/annotations.js"></script>
+</body>
+</html>

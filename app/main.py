@@ -12,9 +12,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import database
+from .annotation_model import (
+    LABEL_NEEDS_CHECK,
+    LABEL_NO_CHECK,
+    all_sentences,
+    label_counts,
+    sentence_lookup,
+    threshold_met,
+)
 from .articles_data import ARTICLES, TOPICS
 from .tfidf_model import get_model
-from .worker import get_worker
+from .worker import get_training_worker, get_worker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("recommender")
@@ -32,6 +40,84 @@ class ConditionIn(BaseModel):
 class ExclusionIn(BaseModel):
     article_id: int = Field(ge=1)
     compute_delay_ms: int = Field(default=0, ge=0, le=30000)
+
+
+class AnnotationChange(BaseModel):
+    article_id: int = Field(ge=1)
+    sentence_index: int = Field(ge=0)
+    # needs_check / no_check 新增或更正；null 表示撤销该句标注
+    label: str | None = Field(default=None)
+
+
+class AnnotationsIn(BaseModel):
+    revision: int = Field(ge=0, description="提交所基于的标注修订号")
+    changes: list[AnnotationChange] = Field(min_length=1, max_length=200)
+
+
+class TrainIn(BaseModel):
+    revision: int = Field(ge=0, description="提交所基于的标注修订号")
+    simulate_failure: bool = Field(
+        default=False, description="演示开关：让本次训练失败以验证失败状态"
+    )
+
+
+def _annotation_payload() -> dict:
+    """标注区完整数据：待标句按原文顺序 + 标注 + 修订号 + 最近训练任务。
+
+    训练前不暴露任何概率；概率只出现在 done 状态且修订号匹配的训练结果里。
+    """
+    ann_state = database.get_annotation_state()
+    label_rows = {
+        (item["article_id"], item["sentence_index"]): item
+        for item in ann_state["labels"]
+    }
+    sentences = []
+    for sentence in all_sentences():
+        key = (sentence["article_id"], sentence["sentence_index"])
+        item = label_rows.get(key)
+        label = item["label"] if item else None
+        sentences.append(
+            {
+                **sentence,
+                "label": label,
+                "label_display": (
+                    "需核查" if label == LABEL_NEEDS_CHECK
+                    else "无需核查" if label == LABEL_NO_CHECK
+                    else None
+                ),
+                "updated_at": item["updated_at"] if item else None,
+            }
+        )
+    counts = label_counts(
+        {
+            (item["article_id"], item["sentence_index"]): item["label"]
+            for item in ann_state["labels"]
+        }
+    )
+    job = database.get_latest_training_job()
+    # 训练结果只有在“已完成且基于当前修订号”时才算当前建议
+    suggestions = None
+    stale_result = False
+    if job and job["status"] == "done" and job["result"]:
+        if job["base_revision"] == ann_state["revision"]:
+            suggestions = job["result"]
+        else:
+            stale_result = True
+    return {
+        "revision": ann_state["revision"],
+        "updated_at": ann_state["updated_at"],
+        "sentences": sentences,
+        "counts": counts,
+        "threshold": {"needs_check": 2, "no_check": 2, "met": threshold_met(counts)},
+        "training": {
+            "job": job,
+            "suggestions": suggestions,
+            "stale_result": stale_result,
+            "suggestions_based_on_revision": (
+                job["base_revision"] if suggestions is not None else None
+            ),
+        },
+    }
 
 def _validate_quotas(quotas: dict[str, int]) -> None:
     unknown = set(quotas) - set(TOPICS)
@@ -69,6 +155,7 @@ def _status_payload() -> dict:
         "plan": plan,
         "topics": TOPICS,
         "articles": [_article_brief(a) for a in ARTICLES],
+        "annotation_revision": database.get_annotation_revision(),
     }
 
 
@@ -81,9 +168,11 @@ async def lifespan(app: FastAPI):
     except Exception:  # pragma: no cover
         log.exception("TF-IDF 预热失败")
     get_worker().start()
+    get_training_worker().start()
     try:
         yield
     finally:
+        get_training_worker().stop()
         get_worker().stop()
 
 
@@ -94,6 +183,11 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+@app.get("/annotations")
+def annotations_page() -> FileResponse:
+    return FileResponse(os.path.join(STATIC_DIR, "annotations.html"))
 
 
 @app.get("/api/status")
@@ -172,6 +266,100 @@ def reveal() -> dict:
 
 @app.post("/api/reset")
 def reset_demo() -> dict:
-    """重置演示：清空揭示、排除与任务，世代回到 1。"""
+    """重置演示：清空揭示、排除、标注与任务，世代回到 1。"""
     database.reset_all(DEFAULT_INTEREST, {t: 1 for t in TOPICS})
     return _status_payload()
+
+
+# ---------------- 医学事实核查标注区 ----------------
+
+
+@app.get("/api/annotations")
+def get_annotations() -> dict:
+    return _annotation_payload()
+
+
+@app.post("/api/annotations")
+def submit_annotations(body: AnnotationsIn) -> dict:
+    """提交标注修改；revision 必须是提交者看到的当前修订号，否则冲突。"""
+    lookup = sentence_lookup()
+    changes = []
+    for change in body.changes:
+        key = (change.article_id, change.sentence_index)
+        if key not in lookup:
+            raise HTTPException(
+                404, f"句子不存在于医疗健康语料: 文章 {change.article_id} "
+                     f"第 {change.sentence_index} 句"
+            )
+        if change.label not in (None, LABEL_NEEDS_CHECK, LABEL_NO_CHECK):
+            raise HTTPException(422, f"未知标注: {change.label}")
+        changes.append(
+            {
+                "article_id": change.article_id,
+                "sentence_index": change.sentence_index,
+                "label": change.label,
+                "text": lookup[key]["text"],
+            }
+        )
+    try:
+        database.submit_annotations(body.revision, changes, set(lookup))
+    except database.RevisionConflictError as exc:
+        raise HTTPException(
+            409,
+            {
+                "code": "revision_conflict",
+                "message": str(exc),
+                "expected_revision": exc.expected,
+                "current_revision": exc.current,
+            },
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    return _annotation_payload()
+
+
+@app.post("/api/train")
+def train(body: TrainIn) -> dict:
+    """基于已确认标注训练分类器并推荐下一轮待核查句。"""
+    current_rev = database.get_annotation_revision()
+    if body.revision != current_rev:
+        raise HTTPException(
+            409,
+            {
+                "code": "revision_conflict",
+                "message": (
+                    f"标注修订号冲突：提交基于修订 {body.revision}，"
+                    f"当前已是修订 {current_rev}；请刷新后重试"
+                ),
+                "expected_revision": body.revision,
+                "current_revision": current_rev,
+            },
+        )
+    labels = database.get_annotations()
+    counts = label_counts(labels)
+    if not threshold_met(counts):
+        raise HTTPException(
+            409,
+            f"标注数量不足：需核查与无需核查各至少 2 句，"
+            f"当前为 {counts['needs_check']} / {counts['no_check']}",
+        )
+    latest = database.get_latest_training_job()
+    if latest and latest["status"] in ("pending", "running"):
+        raise HTTPException(409, "已有训练任务正在进行，请稍候")
+    try:
+        job = database.create_training_job(current_rev, body.simulate_failure)
+    except database.RevisionConflictError as exc:
+        raise HTTPException(
+            409,
+            {
+                "code": "revision_conflict",
+                "message": str(exc),
+                "expected_revision": exc.expected,
+                "current_revision": exc.current,
+            },
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    payload = _annotation_payload()
+    payload["training"]["job"] = job
+    return payload

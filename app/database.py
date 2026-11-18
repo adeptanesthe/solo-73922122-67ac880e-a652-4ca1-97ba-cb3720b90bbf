@@ -40,6 +40,18 @@ _reveal_batch_outcome: dict[str, Any] | None = None
 _reveal_batch_lock = threading.Lock()
 
 
+class RevisionConflictError(Exception):
+    """提交所基于的标注修订号已过期（例如另一个窗口先提交了）。"""
+
+    def __init__(self, expected: int, current: int) -> None:
+        self.expected = expected
+        self.current = current
+        super().__init__(
+            f"标注修订号冲突：提交基于修订 {expected}，当前已是修订 {current}；"
+            "请刷新后基于最新标注重试"
+        )
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -132,7 +144,50 @@ def init_db() -> None:
                     outcome_json TEXT NOT NULL,
                     expires_at REAL NOT NULL
                 );
+
+                -- 医疗健康句子的确认标注。修订号 rev 单调递增，双窗口提交须核对。
+                CREATE TABLE IF NOT EXISTS annotations (
+                    article_id INTEGER NOT NULL,
+                    sentence_index INTEGER NOT NULL,
+                    label TEXT NOT NULL,              -- needs_check / no_check
+                    sentence_text TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (article_id, sentence_index)
+                );
+
+                -- 标注修订号（单行，随任何标注增删改递增）
+                CREATE TABLE IF NOT EXISTS annotation_meta (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    revision INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                -- 训练任务：每次“开始训练”登记一条；epoch 记录其基于的标注修订号
+                CREATE TABLE IF NOT EXISTS training_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    status TEXT NOT NULL,              -- pending/running/done/failed/stale
+                    base_revision INTEGER NOT NULL,
+                    simulate_failure INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    result_json TEXT,
+                    error TEXT
+                );
                 """
+            )
+            # 轻量迁移：补充 simulate_failure 列（用于演示训练失败）
+            training_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(training_jobs)")
+            }
+            if training_cols and "simulate_failure" not in training_cols:
+                conn.execute(
+                    "ALTER TABLE training_jobs ADD COLUMN "
+                    "simulate_failure INTEGER NOT NULL DEFAULT 0"
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO annotation_meta(id, revision, updated_at) "
+                "VALUES (1, 0, ?)",
+                (_now(),),
             )
             # 轻量迁移：早期版本 reveal_claims.expires_at 为 TEXT，
             # 与 POSIX 时间戳比较不兼容，发现旧结构时重建。
@@ -559,6 +614,242 @@ def _save_claim(
     )
 
 
+# ---------------- 标注与训练任务 ----------------
+
+
+def get_annotation_revision() -> int:
+    with _read_tx() as conn:
+        return conn.execute(
+            "SELECT revision FROM annotation_meta WHERE id = 1"
+        ).fetchone()[0]
+
+
+def get_annotations() -> dict[tuple[int, int], str]:
+    with _read_tx() as conn:
+        rows = conn.execute(
+            "SELECT article_id, sentence_index, label FROM annotations"
+        ).fetchall()
+    return {(r["article_id"], r["sentence_index"]): r["label"] for r in rows}
+
+
+def get_annotation_state() -> dict[str, Any]:
+    with _read_tx() as conn:
+        meta = conn.execute(
+            "SELECT revision, updated_at FROM annotation_meta WHERE id = 1"
+        ).fetchone()
+        rows = conn.execute(
+            "SELECT article_id, sentence_index, label, sentence_text, updated_at "
+            "FROM annotations ORDER BY article_id, sentence_index"
+        ).fetchall()
+    return {
+        "revision": meta["revision"],
+        "updated_at": meta["updated_at"],
+        "labels": [
+            {
+                "article_id": r["article_id"],
+                "sentence_index": r["sentence_index"],
+                "label": r["label"],
+                "text": r["sentence_text"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ],
+    }
+
+
+def submit_annotations(
+    base_revision: int,
+    changes: list[dict[str, Any]],
+    valid_keys: set[tuple[int, int]],
+) -> dict[str, Any]:
+    """原子提交一批标注修改；base_revision 与当前修订号不符即冲突。
+
+    changes 元素：{article_id, sentence_index, label}，label 为
+    needs_check / no_check 时新增或更正，为 None 时撤销该句标注。
+    只有真正改变了库内标注时才推进修订号。
+    """
+    with _write_tx() as conn:
+        meta = conn.execute(
+            "SELECT revision FROM annotation_meta WHERE id = 1"
+        ).fetchone()
+        current_rev = meta["revision"]
+        if base_revision != current_rev:
+            raise RevisionConflictError(base_revision, current_rev)
+
+        existing = {
+            (r["article_id"], r["sentence_index"]): r["label"]
+            for r in conn.execute(
+                "SELECT article_id, sentence_index, label FROM annotations"
+            )
+        }
+        changed = False
+        for change in changes:
+            key = (int(change["article_id"]), int(change["sentence_index"]))
+            if key not in valid_keys:
+                raise ValueError(
+                    f"句子不存在于医疗健康语料: 文章 {key[0]} 第 {key[1]} 句"
+                )
+            label = change.get("label")
+            if label is not None and label not in ("needs_check", "no_check"):
+                raise ValueError(f"未知标注: {label}")
+            if existing.get(key) == label:
+                continue
+            if label is None:
+                conn.execute(
+                    "DELETE FROM annotations WHERE article_id = ? AND sentence_index = ?",
+                    key,
+                )
+            else:
+                sentence_text = change.get("text") or ""
+                conn.execute(
+                    "INSERT INTO annotations(article_id, sentence_index, label, "
+                    "sentence_text, updated_at) VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(article_id, sentence_index) DO UPDATE SET "
+                    "label = excluded.label, sentence_text = excluded.sentence_text, "
+                    "updated_at = excluded.updated_at",
+                    (key[0], key[1], label, sentence_text, _now()),
+                )
+            changed = True
+
+        if changed:
+            conn.execute(
+                "UPDATE annotation_meta SET revision = revision + 1, updated_at = ? "
+                "WHERE id = 1",
+                (_now(),),
+            )
+            # 修订号变了：此前的训练结果/在途任务都基于旧标注，
+            # 不得再作为“当前建议”展示。
+            conn.execute(
+                "UPDATE training_jobs SET status = 'stale', finished_at = ? "
+                "WHERE status IN ('pending', 'running')",
+                (_now(),),
+            )
+    return get_annotation_state()
+
+
+def create_training_job(
+    base_revision: int, simulate_failure: bool = False
+) -> dict[str, Any]:
+    """登记一条训练任务（调用方已确认标注数量达标）。"""
+    with _write_tx() as conn:
+        current_rev = conn.execute(
+            "SELECT revision FROM annotation_meta WHERE id = 1"
+        ).fetchone()[0]
+        if base_revision != current_rev:
+            raise RevisionConflictError(base_revision, current_rev)
+        active = conn.execute(
+            "SELECT 1 FROM training_jobs WHERE status IN ('pending', 'running') "
+            "LIMIT 1"
+        ).fetchone()
+        if active:
+            raise ValueError("已有训练任务正在进行，请稍候")
+        conn.execute(
+            "UPDATE training_jobs SET status = 'stale', finished_at = ? "
+            "WHERE status IN ('pending', 'running')",
+            (_now(),),
+        )
+        cur = conn.execute(
+            "INSERT INTO training_jobs(status, base_revision, simulate_failure, "
+            "created_at) VALUES ('pending', ?, ?, ?)",
+            (base_revision, 1 if simulate_failure else 0, _now()),
+        )
+        job_id = cur.lastrowid
+    return get_training_job(int(job_id))
+
+
+def _training_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    keys = row.keys()
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "base_revision": row["base_revision"],
+        "simulate_failure": bool(row["simulate_failure"])
+        if "simulate_failure" in keys
+        else False,
+        "result": json.loads(row["result_json"]) if row["result_json"] else None,
+        "error": row["error"],
+        "created_at": row["created_at"],
+        "finished_at": row["finished_at"],
+    }
+
+
+def get_training_job(job_id: int) -> dict[str, Any] | None:
+    with _read_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM training_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        return _training_row_to_dict(row) if row else None
+
+
+def get_latest_training_job() -> dict[str, Any] | None:
+    with _read_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM training_jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return _training_row_to_dict(row) if row else None
+
+
+def claim_pending_training_job() -> dict[str, Any] | None:
+    with _write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM training_jobs WHERE status = 'pending' "
+            "ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        job_id = row["id"]
+        conn.execute(
+            "UPDATE training_jobs SET status = 'running' WHERE id = ?", (job_id,)
+        )
+    return get_training_job(job_id)
+
+
+def complete_training_job(
+    job_id: int, base_revision: int, result: dict[str, Any]
+) -> bool:
+    """写回训练结果；标注已更正（修订号变化）则拒绝并标记 stale。"""
+    with _write_tx() as conn:
+        row = conn.execute(
+            "SELECT status FROM training_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        current_rev = conn.execute(
+            "SELECT revision FROM annotation_meta WHERE id = 1"
+        ).fetchone()[0]
+        if not row or row["status"] != "running" or current_rev != base_revision:
+            conn.execute(
+                "UPDATE training_jobs SET status = 'stale', finished_at = ? "
+                "WHERE id = ? AND status = 'running'",
+                (_now(), job_id),
+            )
+            return False
+        conn.execute(
+            "UPDATE training_jobs SET status = 'done', result_json = ?, "
+            "finished_at = ? WHERE id = ?",
+            (json.dumps(result, ensure_ascii=False), _now(), job_id),
+        )
+        return True
+
+
+def fail_training_job(job_id: int, base_revision: int, error: str) -> bool:
+    """记录训练失败；标注保留不动，失败状态可展示。"""
+    with _write_tx() as conn:
+        row = conn.execute(
+            "SELECT status FROM training_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if not row or row["status"] != "running":
+            return False
+        current_rev = conn.execute(
+            "SELECT revision FROM annotation_meta WHERE id = 1"
+        ).fetchone()[0]
+        new_status = "failed" if current_rev == base_revision else "stale"
+        conn.execute(
+            "UPDATE training_jobs SET status = ?, error = ?, finished_at = ? "
+            "WHERE id = ?",
+            (new_status, error[:500], _now(), job_id),
+        )
+        return current_rev == base_revision
+
+
 # ---------------- 演示重置 ----------------
 
 
@@ -573,6 +864,13 @@ def reset_all(
         conn.execute("DELETE FROM exclusions")
         conn.execute("DELETE FROM jobs")
         conn.execute("DELETE FROM reveal_claims")
+        # 标注区与训练记录一并重置
+        conn.execute("DELETE FROM annotations")
+        conn.execute("DELETE FROM training_jobs")
+        conn.execute(
+            "UPDATE annotation_meta SET revision = 0, updated_at = ? WHERE id = 1",
+            (_now(),),
+        )
         conn.execute(
             "UPDATE state SET interest = ?, quotas_json = ?, generation = 1, "
             "revealed_json = '[]', updated_at = ? WHERE id = 1",

@@ -12,6 +12,7 @@ import threading
 import time
 
 from . import database
+from .annotation_model import train_and_suggest
 from .optimizer import solve_queue
 from .tfidf_model import get_model
 
@@ -113,3 +114,89 @@ _worker = ComputeWorker()
 
 def get_worker() -> ComputeWorker:
     return _worker
+
+
+class TrainingWorker:
+    """后台训练线程：领取 pending 训练任务，基于领取时的标注修订号训练。
+
+    * 训练前核对标注修订号，标注已被更正则任务作废（stale），旧建议不会当作
+      新结果；
+    * 训练异常只把任务标记 failed，已确认标签原样保留。
+    """
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._busy = threading.Event()
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="training-worker", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+        self._thread = None
+
+    def wait_idle(self, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while self._busy.is_set() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return not self._busy.is_set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                job = database.claim_pending_training_job()
+            except Exception:  # pragma: no cover - 数据库临时故障重试
+                log.exception("领取训练任务失败，稍后重试")
+                time.sleep(0.5)
+                continue
+            if job is None:
+                self._stop.wait(0.25)
+                continue
+            self._busy.set()
+            try:
+                self._process(job)
+            finally:
+                self._busy.clear()
+
+    def _process(self, job: dict) -> None:
+        job_id = job["id"]
+        base_revision = job["base_revision"]
+        try:
+            # 训练开始前确认标注没有被更正
+            current_rev = database.get_annotation_revision()
+            if current_rev != base_revision:
+                database.complete_training_job(job_id, base_revision, {})
+                return
+            labels = database.get_annotations()
+            if job.get("simulate_failure"):
+                raise RuntimeError("模拟训练失败（演示开关）")
+            result = train_and_suggest(labels)
+            accepted = database.complete_training_job(
+                job_id, base_revision, result
+            )
+            if not accepted:
+                log.info("训练任务 %s 基于的标注已被更正，结果丢弃", job_id)
+        except Exception as exc:
+            log.exception("训练任务 %s 失败", job_id)
+            try:
+                database.fail_training_job(
+                    job_id, base_revision, f"{type(exc).__name__}: {exc}"
+                )
+            except Exception:  # pragma: no cover
+                log.exception("写入训练失败状态时出错")
+
+
+_training_worker = TrainingWorker()
+
+
+def get_training_worker() -> TrainingWorker:
+    return _training_worker

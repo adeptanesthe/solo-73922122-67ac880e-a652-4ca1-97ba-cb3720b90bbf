@@ -98,6 +98,38 @@ pytest
 `compute_delay_ms` 用于在演示中人为制造慢重算（0~30000 毫秒），观察并发改条件与
 过期保护行为。交互式文档见 `/docs`。
 
+## 医学事实核查标注区
+
+除选题推荐外，网页新增 `/annotations` 标注区，供健康专栏编辑找出需要医学事实核查的句子：
+
+- **切句**：内置 5 篇「医疗健康」主题文章共 25 句，按 `。！？` 切分并保留标点；
+  页面按**原文顺序**逐句展示，训练前不显示任何概率；
+- **标注**：每句可标为「需核查 / 无需核查」，可随时**更正**或撤销；
+- **训练**：两类各至少 2 句后，在**已确认标注**上拟合字符 2~3 元 TF-IDF
+  （`analyzer="char", ngram_range=(2,3)`）+ 逻辑回归二分类器；
+- **推荐**：每轮取全局预测概率**最接近 0.5** 的至多 3 条未标句，且**同篇最多一条**，
+  卡片显示概率并可直接标注；
+- **修订号与双窗口**：所有标注提交与训练请求都必须携带所基于的标注修订号 `revision`；
+  服务端在写事务内核对，不符则返回 `409 revision_conflict`，页面提示冲突并自动刷新，
+  不会覆盖他人修改；
+- **更正使旧建议失效**：任何标注变更都会推进修订号，并把在途训练任务标记 `stale`；
+  已完成的训练结果若基于旧修订号，`suggestions` 不再返回（`stale_result=true`），
+  需重新训练；
+- **训练失败**：任务标记 `failed` 并展示错误；已确认标签原样保留，不推进修订号。
+
+原有选题推荐功能与接口保持不变，两个页面通过顶部导航切换。
+
+### 标注 / 训练接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/annotations` | 待标句（原文顺序）、标注、计数、修订号、最近训练任务与当前建议 |
+| `POST` | `/api/annotations` | 提交标注：`{revision, changes:[{article_id, sentence_index, label}]}`，`label=null` 撤销；修订号不符返回 409 |
+| `POST` | `/api/train` | 训练：`{revision, simulate_failure?}`；标注不足返回 409，成功登记后台任务 |
+| `GET` | `/annotations` | 标注区页面 |
+
+`simulate_failure=true` 为演示开关，用于验证“训练失败仍保留标签并显示失败状态”。
+
 ## 目录结构
 
 ```
@@ -105,11 +137,12 @@ app/
   articles_data.py   # 30 篇本地文章语料
   tfidf_model.py     # 仅文章拟合的字符 2~3 元 TF-IDF 单例
   optimizer.py       # 精确全局最优求解器（枚举 + 分支定界）
-  database.py        # SQLite 持久化、世代、票据、串行写事务
-  worker.py          # 后台异步重算线程与过期/失败处理
+  annotation_model.py# 医疗健康切句 + 标注二分类器与推荐规则
+  database.py        # SQLite 持久化、世代、票据、标注修订号、串行写事务
+  worker.py          # 后台重算线程 + 训练线程（过期/失败处理）
   main.py            # FastAPI 路由与生命周期
-  static/            # 演示网页（index.html / app.js / style.css）
-tests/               # 求解器对拍、TF-IDF 约束、端到端 API 测试
+  static/            # 演示网页（推荐 index.html / 标注 annotations.html）
+tests/               # 求解器对拍、TF-IDF 约束、标注流程、端到端 API 测试
 Dockerfile, docker-compose.yml, requirements.txt
 ```
 
@@ -121,3 +154,6 @@ Dockerfile, docker-compose.yml, requirements.txt
   多用户隔离需要再引入会话 ID 维度。
 - 并发去重的宽限窗口是时间启发式（默认 2 秒）：足以覆盖线程调度、双击与网络重试，
   又远小于人工两次点击间隔；可通过环境变量调整。
+- 标注区语料固定为内置的 5 篇医疗健康文章（25 句）；二分类器为字符 2~3 元 TF-IDF +
+  逻辑回归，标注样本很少时（恰好两类各 2 句）概率接近 0.5，推荐排序会更多由
+  “离 0.5 的距离 + 文章/句序” 确定性打破平局决定，属演示规模下的预期行为。
